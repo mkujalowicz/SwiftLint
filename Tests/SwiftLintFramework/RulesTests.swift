@@ -140,4 +140,8 @@ class RulesTests: XCTestCase {
     func testVariableName() {
         verifyRule(VariableNameRule.description)
     }
+    
+    func testStringLiteralRule() {
+        verifyRule(StringLiteralRule.description)
+    }
 }
