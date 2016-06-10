@@ -10,10 +10,11 @@ import Foundation
 import SourceKittenFramework
 
 extension Structure {
-    internal func structureDictionariesAtOffset(byteOffset: Int) -> [[String: SourceKitRepresentable]] {
-        var results = [[String: SourceKitRepresentable]]()
-        
-        func parse(dictionary: [String : SourceKitRepresentable]) {
+    internal typealias StructureDictionary = [String: SourceKitRepresentable]
+    internal func structDictionariesAtOffset(byteOffset: Int) -> [StructureDictionary] {
+        var results = [StructureDictionary]()
+
+        func parse(dictionary: StructureDictionary) {
             guard let
                 offset = (dictionary["key.offset"] as? Int64).map({ Int($0) }),
                 byteRange = (dictionary["key.length"] as? Int64).map({ Int($0) })
@@ -25,7 +26,7 @@ extension Structure {
                 results.append(dictionary)
             }
             if let subStructure = dictionary["key.substructure"] as? [SourceKitRepresentable] {
-                for case let dictionary as [String : SourceKitRepresentable] in subStructure {
+                for case let dictionary as StructureDictionary in subStructure {
                     parse(dictionary)
                 }
             }
@@ -36,9 +37,17 @@ extension Structure {
 }
 
 public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
-    
+
+    private enum ValidationStatus {
+        case ValidContinue
+        case ValidStop
+        case InvalidStop
+    }
+
+    private typealias StructValidationBlock = (kind: String, name: String?) -> ValidationStatus
+
     public var configuration = SeverityConfiguration(.Warning)
-    
+
     public init() {}
 
     public static let description = RuleDescription(
@@ -75,7 +84,7 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
             "let some = obj.pathForResource(\"String\", ofType: 2)"
         ]
     )
-    
+
     public func validateFile(file: File) -> [StyleViolation] {
         let strings = file.syntaxMap.tokens.filter { token in
             guard token.type == SyntaxKind.String.rawValue && token.length > 2 else {
@@ -97,50 +106,56 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
                 location: Location(file: file, byteOffset: $0.offset))
         }
     }
-    
+
     private func isStringTokenAtOffsetValid(byteOffset: Int, file: File) -> Bool {
-        let dictionariesStartingFromLeaf = file.structure.structureDictionariesAtOffset(byteOffset).reverse() as [[String: SourceKitRepresentable]]
+        let dictionariesStartingFromLeaf =
+            file.structure.structDictionariesAtOffset(byteOffset).reverse()
+                as [Structure.StructureDictionary]
         if dictionariesStartingFromLeaf.count == 0 {
             return true
         }
         // Is enum associated value ?
+        let enumValidationBlock: StructValidationBlock = { kind, _ in
+            return kind == SwiftDeclarationKind.Enumelement.rawValue ? .ValidStop: .InvalidStop
+        }
         if getWhitelistedStructureForDictionaries(
             dictionariesStartingFromLeaf,
-            validationBlock: { $0.kind == SwiftDeclarationKind.Enumelement.rawValue ? .ValidStop: .InvalidStop }) != nil {
+            validationBlock: enumValidationBlock) != nil {
             return true
         }
         // Is global/class/static variable ?
+        let staticVarValidationBlock: StructValidationBlock = { kind, _ in
+            return StringLiteralRule.isGlobalOrStaticVarKind(kind, acceptCollections: true)
+        }
         if let staticVar = getWhitelistedStructureForDictionaries(
             dictionariesStartingFromLeaf,
-            validationBlock: { return StringLiteralRule.isGlobalOrStaticVarKind($0.kind, acceptCollections: true) }) {
+            validationBlock: staticVarValidationBlock) {
             if StringLiteralRule.isGlobalOrStaticVarKind(staticVar.kind ?? "",
                                                          acceptCollections: false) == .InvalidStop {
                 return false
             }
-            if let setter = staticVar["key.setter_accessibility"] as? String where setter.isEmpty == false {
+            if let setter = staticVar["key.setter_accessibility"] as? String where !setter.isEmpty {
                 return false // mutable variable
             } else {
                 return true
             }
         }
         // Is expression call ?
+        let expressionCallValidationBlock: StructValidationBlock = { kind, name in
+            return StringLiteralRule.isWhitelistedExpressionCallKind(kind, name: name)
+        }
         if let expressionCall = getWhitelistedStructureForDictionaries(
-            dictionariesStartingFromLeaf, validationBlock: { return StringLiteralRule.isWhitelistedExpressionCallKind($0.kind, name: $0.name) }) {
+            dictionariesStartingFromLeaf,
+            validationBlock: expressionCallValidationBlock) {
             return expressionCall.kind ?? "" == "source.lang.swift.expr.call"
         }
         return false
     }
-    
-    private enum ValidationStatus {
-        case ValidContinue
-        case ValidStop
-        case InvalidStop
-    }
-    
+
     private func getWhitelistedStructureForDictionaries(
-        dicts: [[String: SourceKitRepresentable]],
-        validationBlock: (kind: String, name: String?) -> ValidationStatus) -> [String: SourceKitRepresentable]? {
-        var lastValidStruct: [String: SourceKitRepresentable]? = nil
+        dicts: [Structure.StructureDictionary],
+        validationBlock: StructValidationBlock) -> Structure.StructureDictionary? {
+        var lastValidStruct: Structure.StructureDictionary? = nil
         for dict in dicts {
             let name = dict["key.name"] as? String
             switch validationBlock(kind: dict.kind ?? "", name: name) {
@@ -154,8 +169,9 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
         }
         return lastValidStruct
     }
-    
-    private static func isGlobalOrStaticVarKind(kind: String, acceptCollections: Bool) -> ValidationStatus {
+
+    private static func isGlobalOrStaticVarKind(kind: String,
+                                                acceptCollections: Bool) -> ValidationStatus {
         switch kind {
         case "source.lang.swift.expr.dictionary":
             if acceptCollections {
@@ -179,8 +195,9 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
             return .InvalidStop
         }
     }
-    
-    private static func isWhitelistedExpressionCallKind(kind: String, name: String?) -> ValidationStatus {
+
+    private static func isWhitelistedExpressionCallKind(kind: String,
+                                                        name: String?) -> ValidationStatus {
         switch kind {
         case SwiftDeclarationKind.VarParameter.rawValue:
             return .ValidContinue
@@ -193,7 +210,7 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
             return .InvalidStop
         }
     }
-    
+
     private static func isExpressionWhitelisted(expr: String) -> Bool {
         return StringLiteralRule.exprWhitelistEqual.contains(expr)
             || StringLiteralRule.exprWhitelistSuffix.filter() {
@@ -203,7 +220,7 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
                 expr.hasPrefix($0)
                 }.count > 0
     }
-    
+
     private static let exprWhitelistEqual: [String] = [
         "print",
         "assert",
@@ -211,11 +228,11 @@ public struct StringLiteralRule: ConfigurationProviderRule, OptInRule {
         "NSLocalizedString",
         "Selector"
     ]
-    
+
     private static let exprWhitelistSuffix: [String] = [
         ".localizedStringForKey"
     ]
-    
+
     private static let exprWhitelistPrefix: [String] = [
         "XCTAssert"
     ]
